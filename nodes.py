@@ -116,10 +116,9 @@ EXTRA_OPTIONS = [
 	"""Your response will be used by a text-to-image model, so avoid useless meta phrases like “This image shows…”, "You are looking at...", etc.""",
 ]
 
-CAPTION_LENGTH_CHOICES = (
-    ["any", "very short", "short", "medium-length", "long", "very long"] +
-    [str(i) for i in range(20, 261, 10)]
-)
+CAPTION_LENGTH_CHOICES = ["any", "very short", "short", "medium-length", "long", "very long"] + [
+	str(i) for i in range(20, 261, 10)
+]
 
 
 def build_prompt(caption_type: str, caption_length: str | int, extra_options: list[str], name_input: str) -> str:
@@ -130,18 +129,17 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 		map_idx = 1  # numeric-word-count template
 	else:
 		map_idx = 2  # length descriptor template
-	
+
 	prompt = CAPTION_TYPE_MAP[caption_type][map_idx]
 
 	if extra_options:
 		prompt += " " + " ".join(extra_options)
-	
+
 	return prompt.format(
 		name=name_input or "{NAME}",
 		length=caption_length,
 		word_count=caption_length,
 	)
-
 
 
 class JoyCaptionPredictor:
@@ -150,27 +148,47 @@ class JoyCaptionPredictor:
 		if not checkpoint_path.exists():
 			# Download the model
 			from huggingface_hub import snapshot_download
-			snapshot_download(repo_id=model, local_dir=str(checkpoint_path), force_download=False, local_files_only=False)
-		
+
+			snapshot_download(
+				repo_id=model, local_dir=str(checkpoint_path), force_download=False, local_files_only=False
+			)
+
 		self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 		self.processor = AutoProcessor.from_pretrained(str(checkpoint_path))
 
 		if memory_mode == "Default":
-			self.model = LlavaForConditionalGeneration.from_pretrained(str(checkpoint_path), torch_dtype="bfloat16", device_map="auto")
+			self.model = LlavaForConditionalGeneration.from_pretrained(
+				str(checkpoint_path), torch_dtype="bfloat16", device_map="auto"
+			)
 		else:
 			from transformers import BitsAndBytesConfig
+
 			qnt_config = BitsAndBytesConfig(
 				**MEMORY_EFFICIENT_CONFIGS[memory_mode],
-				llm_int8_skip_modules=["vision_tower", "multi_modal_projector"],   # Transformer's Siglip implementation has bugs when quantized, so skip those.
+				llm_int8_skip_modules=[
+					"vision_tower",
+					"multi_modal_projector",
+				],  # Transformer's Siglip implementation has bugs when quantized, so skip those.
 			)
-			self.model = LlavaForConditionalGeneration.from_pretrained(str(checkpoint_path), torch_dtype="auto", device_map="auto", quantization_config=qnt_config)
+			self.model = LlavaForConditionalGeneration.from_pretrained(
+				str(checkpoint_path), torch_dtype="auto", device_map="auto", quantization_config=qnt_config
+			)
 		print(f"Loaded model {model} with memory mode {memory_mode}")
-		#print(self.model)
+		# print(self.model)
 		self.model.eval()
-	
+
 	@torch.inference_mode()
-	def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
+	def generate(
+		self,
+		image: Image.Image,
+		system: str,
+		prompt: str,
+		max_new_tokens: int,
+		temperature: float,
+		top_p: float,
+		top_k: int,
+	) -> str:
 		convo = [
 			{
 				"role": "system",
@@ -183,12 +201,12 @@ class JoyCaptionPredictor:
 		]
 
 		# Format the conversation
-		convo_string = self.processor.apply_chat_template(convo, tokenize = False, add_generation_prompt = True)
+		convo_string = self.processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
 		assert isinstance(convo_string, str)
 
 		# Process the inputs
-		inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to('cuda')
-		inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
+		inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to("cuda")
+		inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
 
 		# Generate the captions
 		generate_ids = self.model.generate(
@@ -203,16 +221,19 @@ class JoyCaptionPredictor:
 		)[0]
 
 		# Trim off the prompt
-		generate_ids = generate_ids[inputs['input_ids'].shape[1]:]
+		generate_ids = generate_ids[inputs["input_ids"].shape[1] :]
 
 		# Decode the caption
-		caption = self.processor.tokenizer.decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+		caption = self.processor.tokenizer.decode(
+			generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+		)
 		return caption.strip()
 
 
 class JoyCaption:
 	@classmethod
 	def INPUT_TYPES(cls):
+		# fmt: off
 		req = {
 			"image":          ("IMAGE",),
 			"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()),),
@@ -232,10 +253,11 @@ class JoyCaption:
 			"top_p":          ("FLOAT",  {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
 			"top_k":          ("INT",    {"default": 0,   "min": 0,   "max": 100}),
 		}
-		
+		# fmt: on
+
 		return {"required": req}
 
-	RETURN_TYPES = ("STRING","STRING")
+	RETURN_TYPES = ("STRING", "STRING")
 	RETURN_NAMES = ("query", "caption")
 	FUNCTION = "generate"
 	CATEGORY = "JoyCaption"
@@ -243,26 +265,42 @@ class JoyCaption:
 	def __init__(self):
 		self.predictor = None
 		self.current_memory_mode = None
-	
-	def generate(self, image, memory_mode, caption_type, caption_length, extra_option1, extra_option2, extra_option3, extra_option4, extra_option5, person_name, max_new_tokens, temperature, top_p, top_k):
+
+	def generate(
+		self,
+		image,
+		memory_mode,
+		caption_type,
+		caption_length,
+		extra_option1,
+		extra_option2,
+		extra_option3,
+		extra_option4,
+		extra_option5,
+		person_name,
+		max_new_tokens,
+		temperature,
+		top_p,
+		top_k,
+	):
 		# load / swap the model if needed
 		if self.predictor is None or self.current_memory_mode != memory_mode:
 			if self.predictor is not None:
 				del self.predictor
 				self.predictor = None
 				torch.cuda.empty_cache()
-			
+
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
 				self.current_memory_mode = memory_mode
 			except Exception as e:
 				return (f"Error loading model: {e}",)
-		
+
 		extras = [extra_option1, extra_option2, extra_option3, extra_option4, extra_option5]
 		extras = [extra for extra in extras if extra]
 		prompt = build_prompt(caption_type, caption_length, extras, person_name)
 		system_prompt = "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions."
-		
+
 		# This is a bit silly. We get the image as a tensor, and we could just use that directly (just need to resize and adjust the normalization).
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
@@ -277,12 +315,13 @@ class JoyCaption:
 			top_k=top_k,
 		)
 
-		return (prompt,response)
+		return (prompt, response)
 
 
 class JoyCaptionCustom:
 	@classmethod
 	def INPUT_TYPES(cls):
+		# fmt: off
 		return {
 			"required": {
 				"image":          ("IMAGE",),
@@ -296,6 +335,7 @@ class JoyCaptionCustom:
 				"top_k":          ("INT",    {"default": 0,   "min": 0,   "max": 100}),
 			},
 		}
+		# fmt: on
 
 	RETURN_TYPES = ("STRING",)
 	FUNCTION = "generate"
@@ -304,20 +344,20 @@ class JoyCaptionCustom:
 	def __init__(self):
 		self.predictor = None
 		self.current_memory_mode = None
-	
+
 	def generate(self, image, memory_mode, system_prompt, user_query, max_new_tokens, temperature, top_p, top_k):
 		if self.predictor is None or self.current_memory_mode != memory_mode:
 			if self.predictor is not None:
 				del self.predictor
 				self.predictor = None
 				torch.cuda.empty_cache()
-			
+
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
 				self.current_memory_mode = memory_mode
 			except Exception as e:
 				return (f"Error loading model: {e}",)
-		
+
 		# This is a bit silly. We get the image as a tensor, and we could just use that directly (just need to resize and adjust the normalization).
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
