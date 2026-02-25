@@ -4,8 +4,10 @@ import folder_paths
 import comfy.model_management as model_management
 from pathlib import Path
 from PIL import Image
-from torchvision.transforms import ToPILImage
+import torchvision.transforms.functional as TVF
 
+
+JOY_MODEL_ID = "fancyfeast/llama-joycaption-beta-one-hf-llava"
 
 # From (https://github.com/gokayfem/ComfyUI_VLM_nodes/blob/1ca496c1c8e8ada94d7d2644b8a7d4b3dc9729b3/nodes/qwen2vl.py)
 # Apache 2.0 License
@@ -144,7 +146,10 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 
 
 class JoyCaptionPredictor:
-	def __init__(self, model: str, memory_mode: str):
+	def __init__(self, model: str, memory_mode: str, keep_loaded: bool = False):
+		self.keep_loaded = keep_loaded
+		self.memory_mode = memory_mode
+
 		checkpoint_path = Path(folder_paths.models_dir) / "LLavacheckpoints" / Path(model).stem
 		if not checkpoint_path.exists():
 			# Download the model
@@ -155,7 +160,6 @@ class JoyCaptionPredictor:
 			)
 
 		self.checkpoint_path = str(checkpoint_path)
-		self.memory_mode = memory_mode
 
 		self.inference_device = model_management.get_torch_device()
 		self.offload_device = model_management.unet_offload_device()
@@ -209,6 +213,7 @@ class JoyCaptionPredictor:
 	def prepare_for_inference(self):
 		if self.model is None:
 			self._load_model()
+			assert self.model is not None, "Model should be loaded after _load_model()"
 
 		if self.is_kbit:
 			return
@@ -216,8 +221,8 @@ class JoyCaptionPredictor:
 		model_management.free_memory(self.model_size_bytes, self.inference_device)
 		self.model.to(self.inference_device)
 
-	def cleanup_after_inference(self, keep_loaded: bool):
-		if keep_loaded:
+	def cleanup_after_inference(self):
+		if self.keep_loaded:
 			return
 		if self.model is None:
 			return
@@ -248,6 +253,7 @@ class JoyCaptionPredictor:
 	) -> str:
 		# Load the model if it isn't already loaded and move it to the inference device if needed.
 		self.prepare_for_inference()
+		assert self.model is not None, "Model should be loaded after prepare_for_inference()"
 
 		convo = [
 			{
@@ -303,13 +309,36 @@ class JoyCaptionPredictor:
 		return caption.strip()
 
 
+class DownloadAndLoadJoyCaptionModel:
+	@classmethod
+	def INPUT_TYPES(cls):
+		# fmt: off
+		return {"required": {
+			"model":          ("STRING", {"default": JOY_MODEL_ID, "multiline": False, "tooltip": "Model name or path. Can be a HuggingFace repo ID or a local path to a model checkpoint."}),
+			"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()), {"tooltip": "VRAM usage profile. Lower-memory modes use quantization and can be slower."}),
+			"keep_loaded":    ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory for faster subsequent runs.", "advanced": True}),
+		}}
+		# fmt: on
+
+	RETURN_TYPES = ("JOYCAPMODEL",)
+	RETURN_NAMES = ("joycaption_model",)
+	OUTPUT_TOOLTIPS = ("The loaded JoyCaption model ready for use in the JoyCaption node.",)
+	FUNCTION = "load_model"
+	CATEGORY = "JoyCaption"
+	DESCRIPTION = "Loads the JoyCaption model, automatically downloading it if it's not already present."
+
+	def load_model(self, model: str, memory_mode: str, keep_loaded: bool):
+		predictor = JoyCaptionPredictor(model, memory_mode, keep_loaded=keep_loaded)
+		return (predictor,)
+
+
 class JoyCaption:
 	@classmethod
 	def INPUT_TYPES(cls):
 		# fmt: off
 		req = {
+			"model":          ("JOYCAPMODEL", {"tooltip": "The JoyCaption model loaded by the DownloadAndLoadJoyCaptionModel node."}),
 			"image":          ("IMAGE", {"tooltip": "Input image to caption."}),
-			"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()), {"tooltip": "VRAM usage profile. Lower-memory modes use quantization and can be slower."}),
 			"caption_type":   (list(CAPTION_TYPE_MAP.keys()), {"tooltip": "Preset caption style/template."}),
 			"caption_length": (CAPTION_LENGTH_CHOICES, {"tooltip": "Target caption length."}),
 
@@ -325,7 +354,6 @@ class JoyCaption:
 			"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling randomness. Lower is more deterministic.", "advanced": True}),
 			"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling threshold.", "advanced": True}),
 			"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100, "tooltip": "Top-k token filter. Set 0 to disable.", "advanced": True}),
-			"keep_loaded":    ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory for faster subsequent runs.", "advanced": True}),
 		}
 		# fmt: on
 
@@ -341,41 +369,25 @@ class JoyCaption:
 	CATEGORY = "JoyCaption"
 	DESCRIPTION = "Runs JoyCaption on the input image to generate a caption. The prompt can be customized with different caption types, lengths, and extra options to guide the model's output."
 
-	def __init__(self):
-		self.predictor = None
-
 	def generate(
 		self,
-		image,
-		memory_mode,
-		caption_type,
-		caption_length,
-		extra_option1,
-		extra_option2,
-		extra_option3,
-		extra_option4,
-		extra_option5,
-		person_name,
-		max_new_tokens,
+		model: JoyCaptionPredictor,
+		image: torch.Tensor,
+		caption_type: str,
+		caption_length: str,
+		extra_option1: str,
+		extra_option2: str,
+		extra_option3: str,
+		extra_option4: str,
+		extra_option5: str,
+		person_name: str,
+		max_new_tokens: int,
 		temperature: float,
 		top_p: float,
 		top_k: int,
-		keep_loaded: bool,
 	):
 		if image.shape[0] != 1:
 			return ("", "Error: batch size greater than 1 is not supported.")
-
-		# load / swap the model if needed
-		if self.predictor is None or self.predictor.memory_mode != memory_mode:
-			if self.predictor is not None:
-				self.predictor.unload()
-				del self.predictor
-				self.predictor = None
-
-			try:
-				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
-			except Exception as e:
-				return ("", f"Error loading model: {e}")
 
 		extras = [extra_option1, extra_option2, extra_option3, extra_option4, extra_option5]
 		extras = [extra for extra in extras if extra]
@@ -385,9 +397,9 @@ class JoyCaption:
 		# This is a bit silly. We get the image as a tensor, and we could just use that directly (just need to resize and adjust the normalization).
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
-		pil_image = ToPILImage()(image[0].permute(2, 0, 1))
+		pil_image = TVF.to_pil_image(image[0].permute(2, 0, 1))
 		try:
-			response = self.predictor.generate(
+			response = model.generate(
 				image=pil_image,
 				system=system_prompt,
 				prompt=prompt,
@@ -397,7 +409,7 @@ class JoyCaption:
 				top_k=top_k,
 			)
 		finally:
-			self.predictor.cleanup_after_inference(keep_loaded=keep_loaded)
+			model.cleanup_after_inference()
 
 		return (prompt, response)
 
@@ -408,8 +420,8 @@ class JoyCaptionCustom:
 		# fmt: off
 		return {
 			"required": {
+				"model":          ("JOYCAPMODEL", {"tooltip": "The JoyCaption model loaded by the DownloadAndLoadJoyCaptionModel node."}),
 				"image":          ("IMAGE", {"tooltip": "Input image to caption."}),
-				"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()), {"tooltip": "VRAM usage profile. Lower-memory modes use quantization and can be slower."}),
 				"system_prompt":  ("STRING", {"multiline": False, "default": "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions.", "tooltip": "System-level instruction that guides model behavior." }),
 				"user_query":     ("STRING", {"multiline": True, "default": "Write a detailed description for this image.", "tooltip": "Direct prompt/query sent with the image." }),
 				# generation params
@@ -417,7 +429,6 @@ class JoyCaptionCustom:
 				"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling randomness. Lower is more deterministic.", "advanced": True}),
 				"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling threshold.", "advanced": True}),
 				"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100, "tooltip": "Top-k token filter. Set 0 to disable.", "advanced": True}),
-				"keep_loaded":    ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory for faster subsequent runs.", "advanced": True}),
 			},
 		}
 		# fmt: on
@@ -428,41 +439,26 @@ class JoyCaptionCustom:
 	CATEGORY = "JoyCaption"
 	DESCRIPTION = "Runs JoyCaption on the input image to generate a caption. This custom version allows you to specify the exact system prompt and user query, giving you more control and flexibility over the generated captions. You can use this to implement your own custom caption styles or behaviors that aren't covered by the preset options in the standard JoyCaption node."
 
-	def __init__(self):
-		self.predictor = None
-
 	def generate(
 		self,
-		image,
-		memory_mode,
+		model: JoyCaptionPredictor,
+		image: torch.Tensor,
 		system_prompt: str,
 		user_query: str,
 		max_new_tokens: int,
 		temperature: float,
 		top_p: float,
 		top_k: int,
-		keep_loaded: bool,
 	):
 		if image.shape[0] != 1:
 			return ("Error: batch size greater than 1 is not supported.",)
 
-		if self.predictor is None or self.predictor.memory_mode != memory_mode:
-			if self.predictor is not None:
-				self.predictor.unload()
-				del self.predictor
-				self.predictor = None
-
-			try:
-				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
-			except Exception as e:
-				return (f"Error loading model: {e}",)
-
 		# This is a bit silly. We get the image as a tensor, and we could just use that directly (just need to resize and adjust the normalization).
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
-		pil_image = ToPILImage()(image[0].permute(2, 0, 1))
+		pil_image = TVF.to_pil_image(image[0].permute(2, 0, 1))
 		try:
-			response = self.predictor.generate(
+			response = model.generate(
 				image=pil_image,
 				system=system_prompt,
 				prompt=user_query,
@@ -472,7 +468,7 @@ class JoyCaptionCustom:
 				top_k=top_k,
 			)
 		finally:
-			self.predictor.cleanup_after_inference(keep_loaded=keep_loaded)
+			model.cleanup_after_inference()
 
 		return (response,)
 
