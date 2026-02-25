@@ -154,52 +154,85 @@ class JoyCaptionPredictor:
 				repo_id=model, local_dir=str(checkpoint_path), force_download=False, local_files_only=False
 			)
 
+		self.checkpoint_path = str(checkpoint_path)
+		self.memory_mode = memory_mode
+
 		self.inference_device = model_management.get_torch_device()
 		self.offload_device = model_management.unet_offload_device()
 
 		self.processor = AutoProcessor.from_pretrained(str(checkpoint_path))
 
-		if memory_mode == "Default":
-			self.model = LlavaForConditionalGeneration.from_pretrained(str(checkpoint_path), torch_dtype="bfloat16")
+		self.model = None
+		self.model_size_bytes = None
+		self.is_kbit = self.memory_mode != "Default"
+
+	def _load_model(self):
+		# In normal mode:
+		#     We load the model, free memory on the offload device, and then move it to the offload device.
+		# In quantized modes:
+		#     The model must be loaded directory to the inference device.
+		#     This function is only called during inference.
+		#     After inference, if we need to offload, we just unload the model entirely.
+		#     It'll be rebuilt during the next inference.
+		#     We free memory on the inference device if we know how big the model is from a previous load.
+		if self.memory_mode == "Default":
+			self.model = LlavaForConditionalGeneration.from_pretrained(self.checkpoint_path, torch_dtype="bfloat16")
+			self.model_size_bytes = model_management.module_size(self.model)
+			model_management.free_memory(self.model_size_bytes, self.offload_device)
+			self.model.to(self.offload_device)
 		else:
 			from transformers import BitsAndBytesConfig
 
+			if self.model_size_bytes is not None:
+				model_management.free_memory(self.model_size_bytes, self.inference_device)
+
 			qnt_config = BitsAndBytesConfig(
-				**MEMORY_EFFICIENT_CONFIGS[memory_mode],
+				**MEMORY_EFFICIENT_CONFIGS[self.memory_mode],
 				llm_int8_skip_modules=[
 					"vision_tower",
 					"multi_modal_projector",
 				],  # Transformer's Siglip implementation has bugs when quantized, so skip those.
 			)
-			self.model = LlavaForConditionalGeneration.from_pretrained(
-				str(checkpoint_path), torch_dtype="auto", quantization_config=qnt_config
-			)
-		print(f"Loaded model {model} with memory mode {memory_mode}")
-		# print(self.model)
-		self.model.eval()
-		self.model.to(self.offload_device)
 
-	def _get_inference_device(self) -> torch.device:
-		model_device = getattr(self.model, "device", None)
-		if isinstance(model_device, torch.device):
-			return model_device
-		if isinstance(model_device, str):
-			return torch.device(model_device)
-		return self.inference_device
+			self.model = LlavaForConditionalGeneration.from_pretrained(
+				self.checkpoint_path,
+				torch_dtype="auto",
+				quantization_config=qnt_config,
+				device_map=_cuda_device_map(self.inference_device),
+			)
+			self.model_size_bytes = model_management.module_size(self.model)
+
+		self.model.eval()
+
+		print(f"Loaded model (mode={self.memory_mode}, kbit={self.is_kbit})")
 
 	def prepare_for_inference(self):
-		model_management.free_memory(model_management.module_size(self.model), self.inference_device)
+		if self.model is None:
+			self._load_model()
+
+		if self.is_kbit:
+			return
+
+		model_management.free_memory(self.model_size_bytes, self.inference_device)
 		self.model.to(self.inference_device)
 
 	def cleanup_after_inference(self, keep_loaded: bool):
 		if keep_loaded:
 			return
+		if self.model is None:
+			return
+
+		if self.is_kbit:
+			self.unload()
+			return
+
 		self.model.to(self.offload_device)
 		model_management.soft_empty_cache()
 
 	def unload(self):
-		if hasattr(self, "model"):
+		if self.model is not None:
 			del self.model
+			self.model = None
 		model_management.soft_empty_cache()
 
 	@torch.inference_mode()
@@ -213,7 +246,9 @@ class JoyCaptionPredictor:
 		top_p: float,
 		top_k: int,
 	) -> str:
+		# Load the model if it isn't already loaded and move it to the inference device if needed.
 		self.prepare_for_inference()
+
 		convo = [
 			{
 				"role": "system",
@@ -303,7 +338,6 @@ class JoyCaption:
 
 	def __init__(self):
 		self.predictor = None
-		self.current_memory_mode = None
 
 	def generate(
 		self,
@@ -323,8 +357,11 @@ class JoyCaption:
 		top_k: int,
 		keep_loaded: bool,
 	):
+		if image.shape[0] != 1:
+			return ("", "Error: batch size greater than 1 is not supported.")
+
 		# load / swap the model if needed
-		if self.predictor is None or self.current_memory_mode != memory_mode:
+		if self.predictor is None or self.predictor.memory_mode != memory_mode:
 			if self.predictor is not None:
 				self.predictor.unload()
 				del self.predictor
@@ -332,7 +369,6 @@ class JoyCaption:
 
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
-				self.current_memory_mode = memory_mode
 			except Exception as e:
 				return ("", f"Error loading model: {e}")
 
@@ -387,7 +423,6 @@ class JoyCaptionCustom:
 
 	def __init__(self):
 		self.predictor = None
-		self.current_memory_mode = None
 
 	def generate(
 		self,
@@ -401,7 +436,10 @@ class JoyCaptionCustom:
 		top_k: int,
 		keep_loaded: bool,
 	):
-		if self.predictor is None or self.current_memory_mode != memory_mode:
+		if image.shape[0] != 1:
+			return ("Error: batch size greater than 1 is not supported.",)
+
+		if self.predictor is None or self.predictor.memory_mode != memory_mode:
 			if self.predictor is not None:
 				self.predictor.unload()
 				del self.predictor
@@ -409,7 +447,6 @@ class JoyCaptionCustom:
 
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
-				self.current_memory_mode = memory_mode
 			except Exception as e:
 				return (f"Error loading model: {e}",)
 
@@ -431,3 +468,9 @@ class JoyCaptionCustom:
 			self.predictor.cleanup_after_inference(keep_loaded=keep_loaded)
 
 		return (response,)
+
+
+def _cuda_device_map(dev: torch.device):
+	if dev.type == "cuda":
+		return {"": (dev.index or 0)}
+	return {"": str(dev)}
