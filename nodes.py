@@ -308,24 +308,24 @@ class JoyCaption:
 	def INPUT_TYPES(cls):
 		# fmt: off
 		req = {
-			"image":          ("IMAGE",),
-			"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()),),
-			"caption_type":   (list(CAPTION_TYPE_MAP.keys()),),
-			"caption_length": (CAPTION_LENGTH_CHOICES,),
+			"image":          ("IMAGE", {"tooltip": "Input image to caption."}),
+			"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()), {"tooltip": "VRAM usage profile. Lower-memory modes use quantization and can be slower."}),
+			"caption_type":   (list(CAPTION_TYPE_MAP.keys()), {"tooltip": "Preset caption style/template."}),
+			"caption_length": (CAPTION_LENGTH_CHOICES, {"tooltip": "Target caption length."}),
 
-			"extra_option1":  (list(EXTRA_OPTIONS),),
-			"extra_option2":  (list(EXTRA_OPTIONS),),
-			"extra_option3":  (list(EXTRA_OPTIONS),),
-			"extra_option4":  (list(EXTRA_OPTIONS),),
-			"extra_option5":  (list(EXTRA_OPTIONS),),
-			"person_name":    ("STRING", {"default": "", "multiline": False, "placeholder": "only needed if you use the 'If there is a person/character in the image you must refer to them as {name}.' extra option."}),
+			"extra_option1":  (list(EXTRA_OPTIONS), {"tooltip": "Optional instruction appended to the prompt."}),
+			"extra_option2":  (list(EXTRA_OPTIONS), {"tooltip": "Optional instruction appended to the prompt.", "advanced": True}),
+			"extra_option3":  (list(EXTRA_OPTIONS), {"tooltip": "Optional instruction appended to the prompt.", "advanced": True}),
+			"extra_option4":  (list(EXTRA_OPTIONS), {"tooltip": "Optional instruction appended to the prompt.", "advanced": True}),
+			"extra_option5":  (list(EXTRA_OPTIONS), {"tooltip": "Optional instruction appended to the prompt.", "advanced": True}),
+			"person_name":    ("STRING", {"default": "", "multiline": False, "placeholder": "only needed if you use the 'If there is a person/character in the image you must refer to them as {name}.' extra option.", "tooltip": "Replacement value for the {name} placeholder in matching extra options.", "advanced": True}),
 
 			# generation params
-			"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048}),
-			"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-			"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-			"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100}),
-			"keep_loaded":    ("BOOLEAN", {"default": False}),
+			"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048, "tooltip": "Maximum generated tokens before stopping.", "advanced": True}),
+			"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling randomness. Lower is more deterministic.", "advanced": True}),
+			"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling threshold.", "advanced": True}),
+			"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100, "tooltip": "Top-k token filter. Set 0 to disable.", "advanced": True}),
+			"keep_loaded":    ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory for faster subsequent runs.", "advanced": True}),
 		}
 		# fmt: on
 
@@ -333,8 +333,13 @@ class JoyCaption:
 
 	RETURN_TYPES = ("STRING", "STRING")
 	RETURN_NAMES = ("query", "caption")
+	OUTPUT_TOOLTIPS = (
+		"The final prompt sent to the model after applying caption options.",
+		"Generated caption text.",
+	)
 	FUNCTION = "generate"
 	CATEGORY = "JoyCaption"
+	DESCRIPTION = "Runs JoyCaption on the input image to generate a caption. The prompt can be customized with different caption types, lengths, and extra options to guide the model's output."
 
 	def __init__(self):
 		self.predictor = None
@@ -403,23 +408,25 @@ class JoyCaptionCustom:
 		# fmt: off
 		return {
 			"required": {
-				"image":          ("IMAGE",),
-				"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()),),
-				"system_prompt":  ("STRING", {"multiline": False, "default": "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions." }),
-				"user_query":     ("STRING", {"multiline": True, "default": "Write a detailed description for this image." }),
+				"image":          ("IMAGE", {"tooltip": "Input image to caption."}),
+				"memory_mode":    (list(MEMORY_EFFICIENT_CONFIGS.keys()), {"tooltip": "VRAM usage profile. Lower-memory modes use quantization and can be slower."}),
+				"system_prompt":  ("STRING", {"multiline": False, "default": "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions.", "tooltip": "System-level instruction that guides model behavior." }),
+				"user_query":     ("STRING", {"multiline": True, "default": "Write a detailed description for this image.", "tooltip": "Direct prompt/query sent with the image." }),
 				# generation params
-				"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048}),
-				"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-				"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-				"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100}),
-				"keep_loaded":    ("BOOLEAN", {"default": False}),
+				"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048, "tooltip": "Maximum generated tokens before stopping.", "advanced": True}),
+				"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling randomness. Lower is more deterministic.", "advanced": True}),
+				"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling threshold.", "advanced": True}),
+				"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100, "tooltip": "Top-k token filter. Set 0 to disable.", "advanced": True}),
+				"keep_loaded":    ("BOOLEAN", {"default": False, "tooltip": "Keep the model in memory for faster subsequent runs.", "advanced": True}),
 			},
 		}
 		# fmt: on
 
 	RETURN_TYPES = ("STRING",)
+	OUTPUT_TOOLTIPS = ("Generated model response text.",)
 	FUNCTION = "generate"
 	CATEGORY = "JoyCaption"
+	DESCRIPTION = "Runs JoyCaption on the input image to generate a caption. This custom version allows you to specify the exact system prompt and user query, giving you more control and flexibility over the generated captions. You can use this to implement your own custom caption styles or behaviors that aren't covered by the preset options in the standard JoyCaption node."
 
 	def __init__(self):
 		self.predictor = None
