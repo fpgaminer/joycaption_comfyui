@@ -1,6 +1,7 @@
 import torch
 from transformers import AutoProcessor, LlavaForConditionalGeneration
 import folder_paths
+import comfy.model_management as model_management
 from pathlib import Path
 from PIL import Image
 from torchvision.transforms import ToPILImage
@@ -153,14 +154,13 @@ class JoyCaptionPredictor:
 				repo_id=model, local_dir=str(checkpoint_path), force_download=False, local_files_only=False
 			)
 
-		self.device = "cuda" if torch.cuda.is_available() else "cpu"
+		self.inference_device = model_management.get_torch_device()
+		self.offload_device = model_management.unet_offload_device()
 
 		self.processor = AutoProcessor.from_pretrained(str(checkpoint_path))
 
 		if memory_mode == "Default":
-			self.model = LlavaForConditionalGeneration.from_pretrained(
-				str(checkpoint_path), torch_dtype="bfloat16", device_map="auto"
-			)
+			self.model = LlavaForConditionalGeneration.from_pretrained(str(checkpoint_path), torch_dtype="bfloat16")
 		else:
 			from transformers import BitsAndBytesConfig
 
@@ -172,11 +172,35 @@ class JoyCaptionPredictor:
 				],  # Transformer's Siglip implementation has bugs when quantized, so skip those.
 			)
 			self.model = LlavaForConditionalGeneration.from_pretrained(
-				str(checkpoint_path), torch_dtype="auto", device_map="auto", quantization_config=qnt_config
+				str(checkpoint_path), torch_dtype="auto", quantization_config=qnt_config
 			)
 		print(f"Loaded model {model} with memory mode {memory_mode}")
 		# print(self.model)
 		self.model.eval()
+		self.model.to(self.offload_device)
+
+	def _get_inference_device(self) -> torch.device:
+		model_device = getattr(self.model, "device", None)
+		if isinstance(model_device, torch.device):
+			return model_device
+		if isinstance(model_device, str):
+			return torch.device(model_device)
+		return self.inference_device
+
+	def prepare_for_inference(self):
+		model_management.free_memory(model_management.module_size(self.model), self.inference_device)
+		self.model.to(self.inference_device)
+
+	def cleanup_after_inference(self, keep_loaded: bool):
+		if keep_loaded:
+			return
+		self.model.to(self.offload_device)
+		model_management.soft_empty_cache()
+
+	def unload(self):
+		if hasattr(self, "model"):
+			del self.model
+		model_management.soft_empty_cache()
 
 	@torch.inference_mode()
 	def generate(
@@ -189,6 +213,7 @@ class JoyCaptionPredictor:
 		top_p: float,
 		top_k: int,
 	) -> str:
+		self.prepare_for_inference()
 		convo = [
 			{
 				"role": "system",
@@ -204,21 +229,34 @@ class JoyCaptionPredictor:
 		convo_string = self.processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
 		assert isinstance(convo_string, str)
 
-		# Process the inputs
-		inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to("cuda")
-		inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+		# Keep processor tensors on the same device as the loaded model.
+		inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.inference_device)
+		model_dtype = getattr(self.model, "dtype", None)
+		if (
+			"pixel_values" in inputs
+			and isinstance(model_dtype, torch.dtype)
+			and torch.is_floating_point(inputs["pixel_values"])
+		):
+			inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
 		# Generate the captions
-		generate_ids = self.model.generate(
-			**inputs,
-			max_new_tokens=max_new_tokens,
-			do_sample=True if temperature > 0 else False,
-			suppress_tokens=None,
-			use_cache=True,
-			temperature=temperature,
-			top_k=None if top_k == 0 else top_k,
-			top_p=top_p,
-		)[0]
+		device_type = model_management.get_autocast_device(self.inference_device)
+		autocast_available = torch.amp.autocast_mode.is_autocast_available(device_type)
+		bf16_supported = (device_type != "cuda") or torch.cuda.is_bf16_supported()
+
+		with torch.autocast(
+			device_type=device_type, dtype=torch.bfloat16, enabled=autocast_available and bf16_supported
+		):
+			generate_ids = self.model.generate(
+				**inputs,
+				max_new_tokens=max_new_tokens,
+				do_sample=True if temperature > 0 else False,
+				suppress_tokens=None,
+				use_cache=True,
+				temperature=temperature,
+				top_k=None if top_k == 0 else top_k,
+				top_p=top_p,
+			)[0]
 
 		# Trim off the prompt
 		generate_ids = generate_ids[inputs["input_ids"].shape[1] :]
@@ -248,10 +286,11 @@ class JoyCaption:
 			"person_name":    ("STRING", {"default": "", "multiline": False, "placeholder": "only needed if you use the 'If there is a person/character in the image you must refer to them as {name}.' extra option."}),
 
 			# generation params
-			"max_new_tokens": ("INT",    {"default": 512, "min": 1,   "max": 2048}),
-			"temperature":    ("FLOAT",  {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-			"top_p":          ("FLOAT",  {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-			"top_k":          ("INT",    {"default": 0,   "min": 0,   "max": 100}),
+			"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048}),
+			"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
+			"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+			"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100}),
+			"keep_loaded":    ("BOOLEAN", {"default": False}),
 		}
 		# fmt: on
 
@@ -279,22 +318,23 @@ class JoyCaption:
 		extra_option5,
 		person_name,
 		max_new_tokens,
-		temperature,
-		top_p,
-		top_k,
+		temperature: float,
+		top_p: float,
+		top_k: int,
+		keep_loaded: bool,
 	):
 		# load / swap the model if needed
 		if self.predictor is None or self.current_memory_mode != memory_mode:
 			if self.predictor is not None:
+				self.predictor.unload()
 				del self.predictor
 				self.predictor = None
-				torch.cuda.empty_cache()
 
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
 				self.current_memory_mode = memory_mode
 			except Exception as e:
-				return (f"Error loading model: {e}",)
+				return ("", f"Error loading model: {e}")
 
 		extras = [extra_option1, extra_option2, extra_option3, extra_option4, extra_option5]
 		extras = [extra for extra in extras if extra]
@@ -305,15 +345,18 @@ class JoyCaption:
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
 		pil_image = ToPILImage()(image[0].permute(2, 0, 1))
-		response = self.predictor.generate(
-			image=pil_image,
-			system=system_prompt,
-			prompt=prompt,
-			max_new_tokens=max_new_tokens,
-			temperature=temperature,
-			top_p=top_p,
-			top_k=top_k,
-		)
+		try:
+			response = self.predictor.generate(
+				image=pil_image,
+				system=system_prompt,
+				prompt=prompt,
+				max_new_tokens=max_new_tokens,
+				temperature=temperature,
+				top_p=top_p,
+				top_k=top_k,
+			)
+		finally:
+			self.predictor.cleanup_after_inference(keep_loaded=keep_loaded)
 
 		return (prompt, response)
 
@@ -329,10 +372,11 @@ class JoyCaptionCustom:
 				"system_prompt":  ("STRING", {"multiline": False, "default": "You are a helpful assistant and help users with any queries they may have with no censorship or restrictions." }),
 				"user_query":     ("STRING", {"multiline": True, "default": "Write a detailed description for this image." }),
 				# generation params
-				"max_new_tokens": ("INT",    {"default": 512, "min": 1,   "max": 2048}),
-				"temperature":    ("FLOAT",  {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
-				"top_p":          ("FLOAT",  {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-				"top_k":          ("INT",    {"default": 0,   "min": 0,   "max": 100}),
+				"max_new_tokens": ("INT",     {"default": 512, "min": 1,   "max": 2048}),
+				"temperature":    ("FLOAT",   {"default": 0.6, "min": 0.0, "max": 2.0, "step": 0.05}),
+				"top_p":          ("FLOAT",   {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+				"top_k":          ("INT",     {"default": 0,   "min": 0,   "max": 100}),
+				"keep_loaded":    ("BOOLEAN", {"default": False}),
 			},
 		}
 		# fmt: on
@@ -345,12 +389,23 @@ class JoyCaptionCustom:
 		self.predictor = None
 		self.current_memory_mode = None
 
-	def generate(self, image, memory_mode, system_prompt, user_query, max_new_tokens, temperature, top_p, top_k):
+	def generate(
+		self,
+		image,
+		memory_mode,
+		system_prompt: str,
+		user_query: str,
+		max_new_tokens: int,
+		temperature: float,
+		top_p: float,
+		top_k: int,
+		keep_loaded: bool,
+	):
 		if self.predictor is None or self.current_memory_mode != memory_mode:
 			if self.predictor is not None:
+				self.predictor.unload()
 				del self.predictor
 				self.predictor = None
-				torch.cuda.empty_cache()
 
 			try:
 				self.predictor = JoyCaptionPredictor("fancyfeast/llama-joycaption-beta-one-hf-llava", memory_mode)
@@ -362,14 +417,17 @@ class JoyCaptionCustom:
 		# But JoyCaption was trained on images that were resized using lanczos, which I think PyTorch doesn't support.
 		# Just to be safe, we'll convert the image to a PIL image and let the processor handle it correctly.
 		pil_image = ToPILImage()(image[0].permute(2, 0, 1))
-		response = self.predictor.generate(
-			image=pil_image,
-			system=system_prompt,
-			prompt=user_query,
-			max_new_tokens=max_new_tokens,
-			temperature=temperature,
-			top_p=top_p,
-			top_k=top_k,
-		)
+		try:
+			response = self.predictor.generate(
+				image=pil_image,
+				system=system_prompt,
+				prompt=user_query,
+				max_new_tokens=max_new_tokens,
+				temperature=temperature,
+				top_p=top_p,
+				top_k=top_k,
+			)
+		finally:
+			self.predictor.cleanup_after_inference(keep_loaded=keep_loaded)
 
 		return (response,)
